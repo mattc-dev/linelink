@@ -1,3 +1,9 @@
+# Secrets
+client_data.json
+token.json
+quickbooks.json
+qb_tokens.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
