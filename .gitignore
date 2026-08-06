@@ -6,6 +6,8 @@ qb_tokens.json
 errors.log
 my_client_data.json
 query.txt
+processed.json
+failed.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

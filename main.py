@@ -24,6 +24,8 @@ import requests
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
+PROCESSED_FILE = "processed.json"
+FAILED_FILE = "failed.json"
 
 
 class HTMLTextExtractor(HTMLParser):
@@ -89,6 +91,91 @@ def log_error(filename: str, message_id: str, attachment_id: str, reason: str):
         f.write(log_entry)
 
 
+def normalize_sender(sender: str) -> str:
+    """Extracts and lowercases the email address portion of a From header, dropping the display name."""
+    match = re.search(r'<([^>]+)>', sender)
+    email = match.group(1) if match else sender
+    return email.strip().lower()
+
+
+def normalize_payee(payee: str) -> str:
+    """Normalizes a payee/vendor name: collapses whitespace, strips trailing punctuation, and title-cases it."""
+    cleaned = " ".join(payee.split()).strip(" .,-")
+    return cleaned.title() if cleaned else cleaned
+
+
+def load_processed(path: str = PROCESSED_FILE) -> list[dict]:
+    """Loads the list of already-processed invoice fingerprints. Returns [] if missing or unreadable."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Warning: could not read {path} ({e}); starting with empty processed list")
+        return []
+
+
+def save_processed(records: list[dict], path: str = PROCESSED_FILE) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+
+
+def is_duplicate(processed: list[dict], sender: str, txn_date: str, amount: float) -> bool:
+    """Checks whether an invoice with the same (sender, txn_date, amount) fingerprint was already processed."""
+    norm_sender = normalize_sender(sender)
+    rounded_amount = round(float(amount), 2)
+    return any(
+        r.get("sender") == norm_sender
+        and r.get("txn_date") == txn_date
+        and r.get("amount") == rounded_amount
+        for r in processed
+    )
+
+
+def record_processed(processed: list[dict], sender: str, txn_date: str, amount: float,
+                      doc_number: str, payee: str, message_id: str) -> None:
+    """Appends a new fingerprint to the in-memory list and persists it to disk immediately."""
+    processed.append({
+        "sender": normalize_sender(sender),
+        "txn_date": txn_date,
+        "amount": round(float(amount), 2),
+        "doc_number": doc_number,
+        "payee": payee,
+        "message_id": message_id,
+    })
+    save_processed(processed)
+
+
+def load_failed(path: str = FAILED_FILE) -> list[dict]:
+    """Loads the list of invoices that previously failed to transfer. Returns [] if missing or unreadable."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Warning: could not read {path} ({e}); starting with empty failed list")
+        return []
+
+
+def save_failed(records: list[dict], path: str = FAILED_FILE) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+
+
+def record_failed(failed: list[dict], source_label: str, message_id: str, attachment_id: str, reason: str) -> None:
+    """Appends a new failure entry to the in-memory list and persists it to disk immediately."""
+    failed.append({
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source_label,
+        "message_id": message_id,
+        "attachment_id": attachment_id,
+        "reason": reason,
+    })
+    save_failed(failed)
+
+
 def parse_with_ollama(text: str) -> dict | None:
     prompt = f"""
     Analyze the raw invoice text below and extract core financial fields into JSON.
@@ -97,6 +184,7 @@ def parse_with_ollama(text: str) -> dict | None:
     - "amount": numerical float (e.g. 250.00)
     - "doc_number": exact invoice or reference number string (e.g. "INV-1092", "84920"). Do NOT extract labels, prepositions, or headers like "From", "To", "Invoice", "No", "Ref".
     - "txn_date": invoice date or due date formatted strictly as YYYY-MM-DD (e.g., convert "Feb 06 2026" or "06/02/2026" to "2026-02-06").
+    - "payee": the name of the company or person who should be paid (i.e. the vendor issuing this invoice), e.g. "John Doe" or "Victoria Repairs Ltd". It will often be a name. Do not state an activity like "Decorating". It should be a proper noun. Do NOT extract labels like "Payee", "Vendor", "Bill From", or "Company Name" as the value itself.
 
     If a value cannot be found in the text, set that field to null. Return strictly JSON.
 
@@ -128,6 +216,18 @@ def parse_with_ollama(text: str) -> dict | None:
                         if doc_no.lower() in blacklist or len(doc_no) < 2:
                             alt_match = re.search(r'(?:INV|INV-|\b#)\s*([A-Za-z0-9-]+)', text, re.IGNORECASE)
                             doc_no = alt_match.group(1) if alt_match else f"INV-{random.randint(1000, 9999)}"
+
+                        # Payee extraction: ollama -> regex fallback -> generated placeholder (mirrors doc_number)
+                        raw_payee = str(parsed.get("payee") or "").strip()
+                        payee_blacklist = {"payee", "vendor", "company", "biller", "bill from",
+                                            "unknown", "n/a", "na", "none", "null", ""}
+                        if raw_payee.lower() in payee_blacklist or len(raw_payee) < 2:
+                            payee_match = re.search(
+                                r'(?:Payee|Vendor|Pay\s*to|Bill\s*From)\s*[:\-]\s*([A-Za-z0-9&.,\'\- ]{2,60})',
+                                text, re.IGNORECASE
+                            )
+                            raw_payee = payee_match.group(1).strip() if payee_match else f"UNKNOWN-PAYEE-{random.randint(1000, 9999)}"
+                        payee = normalize_payee(raw_payee)
 
                         # Multi-format date extraction without ungrounded fallback
                         raw_date = str(parsed.get("txn_date") or "").strip()
@@ -165,7 +265,7 @@ def parse_with_ollama(text: str) -> dict | None:
                         if not txn_date:
                             last_err = "Missing or unparseable transaction/due date"
                         else:
-                            return {"amount": amount, "doc_number": doc_no, "txn_date": txn_date}
+                            return {"amount": amount, "doc_number": doc_no, "txn_date": txn_date, "payee": payee}
             else:
                 last_err = f"Ollama HTTP {response.status_code}: {response.text}"
         except Exception as e:
@@ -274,11 +374,18 @@ service = build("gmail", "v1", credentials=credentials)
 
 with open("query.txt", "r") as f:
     query = f.read()
-    
+
 print(f"Query: {query}")
 response = service.users().messages().list(userId="me", q=query, maxResults=10).execute()
 messages = response.get("messages", [])
 print(f"Found {len(messages)} messages")
+
+processed = load_processed()
+failed = load_failed()
+print(f"Loaded {len(processed)} previously processed invoice fingerprints")
+
+new_success_count = 0
+new_failed_count = 0
 
 for item in messages:
     message_id = item["id"]
@@ -339,9 +446,17 @@ for item in messages:
             err_msg = f"Failed to extract valid invoice fields from {source_label} after {MAX_RETRIES} attempts"
             print(f"SKIP: {source_label} - {err_msg}")
             log_error(source_label, message_id, attachment_id, err_msg)
+            record_failed(failed, source_label, message_id, attachment_id, err_msg)
+            new_failed_count += 1
             continue
 
-        print(f"Extracted -> Date: {parsed_data['txn_date']}, Doc#: {parsed_data['doc_number']}, Amount: ${parsed_data['amount']}")
+        print(f"Extracted -> Date: {parsed_data['txn_date']}, Doc#: {parsed_data['doc_number']}, "
+              f"Amount: ${parsed_data['amount']}, Payee: {parsed_data['payee']}")
+
+        if is_duplicate(processed, sender, parsed_data["txn_date"], parsed_data["amount"]):
+            print(f"SKIP: {source_label} - duplicate invoice already processed "
+                  f"(sender={normalize_sender(sender)}, date={parsed_data['txn_date']}, amount={parsed_data['amount']})")
+            continue
 
         payload = {
             "PaymentType": "Cash",
@@ -351,7 +466,7 @@ for item in messages:
             "Line": [{
                 "Amount": parsed_data["amount"],
                 "DetailType": "AccountBasedExpenseLineDetail",
-                "Description": f"Parsed Invoice {parsed_data['doc_number']} via Linelink ({source_label})",
+                "Description": f"Parsed Invoice {parsed_data['doc_number']} from {parsed_data['payee']} via Linelink ({source_label})",
                 "AccountBasedExpenseLineDetail": {
                     "AccountRef": {"value": expense_acc_id}
                 }
@@ -362,9 +477,21 @@ for item in messages:
         if qb_err:
             print(f"SKIP: {source_label} - {qb_err}")
             log_error(source_label, message_id, attachment_id, qb_err)
+            record_failed(failed, source_label, message_id, attachment_id, qb_err)
+            new_failed_count += 1
             continue
 
         try:
             print(f"SUCCESS: Created QB Purchase ID: {qb_res.json()['Purchase']['Id']}")
+            record_processed(processed, sender, parsed_data["txn_date"], parsed_data["amount"],
+                              parsed_data["doc_number"], parsed_data["payee"], message_id)
+            new_success_count += 1
         except (KeyError, ValueError) as e:
-            log_error(source_label, message_id, attachment_id, f"QB returned 200 but response was unparseable: {e}")
+            unparseable_reason = f"QB returned 200 but response was unparseable: {e}"
+            log_error(source_label, message_id, attachment_id, unparseable_reason)
+            record_failed(failed, source_label, message_id, attachment_id, unparseable_reason)
+            new_failed_count += 1
+
+print(f"\nRun complete: {new_success_count} new invoice(s) processed and uploaded, "
+      f"{new_failed_count} failed to transfer.")
+print(f"Successful invoices recorded in {PROCESSED_FILE}; failures recorded in {FAILED_FILE} and errors.log.")
