@@ -8,7 +8,10 @@ import socketserver
 import time
 import urllib.parse
 import webbrowser
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime
+from html.parser import HTMLParser
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -22,6 +25,57 @@ import requests
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
 
+
+class HTMLTextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self._text = []
+
+    def handle_data(self, data):
+        self._text.append(data)
+
+    def get_text(self) -> str:
+        return " ".join("".join(self._text).split())
+
+
+def extract_text_from_html(html_str: str) -> str:
+    """Strips HTML tags and extracts plain text content."""
+    parser = HTMLTextExtractor()
+    parser.feed(html_str)
+    return parser.get_text()
+
+
+def extract_text_from_docx(filepath: str) -> str:
+    """Extracts plain text directly from a .docx file using standard library zip/xml."""
+    try:
+        with zipfile.ZipFile(filepath) as z:
+            xml_content = z.read("word/document.xml")
+        tree = ET.fromstring(xml_content)
+        texts = [node.text for node in tree.iter() if node.tag.endswith("}t") and node.text]
+        return " ".join(texts)
+    except Exception as e:
+        print(f"Failed to extract DOCX text from {filepath}: {e}")
+        return ""
+
+
+def get_email_body(payload: dict) -> str:
+    """Recursively walks Gmail payload to extract plain text or HTML body text."""
+    if "parts" in payload:
+        for part in payload["parts"]:
+            body = get_email_body(part)
+            if body:
+                return body
+    mime_type = payload.get("mimeType", "")
+    body_data = payload.get("body", {}).get("data")
+    if body_data:
+        decoded = base64.urlsafe_b64decode(body_data).decode("utf-8", errors="ignore")
+        if mime_type == "text/plain":
+            return decoded
+        elif mime_type == "text/html":
+            return extract_text_from_html(decoded)
+    return ""
+
+
 def log_error(filename: str, message_id: str, attachment_id: str, reason: str):
     """Appends error details with a timestamp to errors.log."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -34,6 +88,7 @@ def log_error(filename: str, message_id: str, attachment_id: str, reason: str):
     with open("errors.log", "a", encoding="utf-8") as f:
         f.write(log_entry)
 
+
 def parse_with_ollama(text: str) -> dict | None:
     prompt = f"""
     Analyze the raw invoice text below and extract core financial fields into JSON.
@@ -41,14 +96,13 @@ def parse_with_ollama(text: str) -> dict | None:
     Required JSON keys:
     - "amount": numerical float (e.g. 250.00)
     - "doc_number": exact invoice or reference number string (e.g. "INV-1092", "84920"). Do NOT extract labels, prepositions, or headers like "From", "To", "Invoice", "No", "Ref".
-    - "txn_date": transaction/invoice date formatted strictly as YYYY-MM-DD.
+    - "txn_date": invoice date or due date formatted strictly as YYYY-MM-DD (e.g., convert "Feb 06 2026" or "06/02/2026" to "2026-02-06").
 
     If a value cannot be found in the text, set that field to null. Return strictly JSON.
 
     Raw Invoice Text:
     {text}
     """
-    fallback_date = datetime.now().strftime("%Y-%m-%d")
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = requests.post(
@@ -58,7 +112,6 @@ def parse_with_ollama(text: str) -> dict | None:
             )
             if response.status_code == 200:
                 parsed = json.loads(response.json()["response"])
-                # Validate amount - fail attempt if missing or non-numeric
                 raw_amount = parsed.get("amount")
                 if raw_amount is None:
                     last_err = "Ollama returned null amount"
@@ -68,6 +121,7 @@ def parse_with_ollama(text: str) -> dict | None:
                     except (ValueError, TypeError):
                         last_err = f"Invalid amount format: {raw_amount}"
                         amount = None
+
                     if amount is not None:
                         doc_no = str(parsed.get("doc_number") or "").strip()
                         blacklist = {"from", "to", "invoice", "inv", "bill", "no", "number", "ref", "none", "null", ""}
@@ -75,27 +129,43 @@ def parse_with_ollama(text: str) -> dict | None:
                             alt_match = re.search(r'(?:INV|INV-|\b#)\s*([A-Za-z0-9-]+)', text, re.IGNORECASE)
                             doc_no = alt_match.group(1) if alt_match else f"INV-{random.randint(1000, 9999)}"
 
-                        # date parsing
+                        # Multi-format date extraction without ungrounded fallback
                         raw_date = str(parsed.get("txn_date") or "").strip()
                         txn_date = None
                         if raw_date and raw_date.lower() != "null":
-                            try:
-                                datetime.strptime(raw_date, "%Y-%m-%d")
-                                txn_date = raw_date
-                            except ValueError:
-                                pass
+                            for date_fmt in ("%Y-%m-%d", "%b %d %Y", "%B %d %Y", "%d %b %Y", "%d %B %Y", "%m/%d/%Y", "%d/%m/%Y"):
+                                try:
+                                    dt = datetime.strptime(raw_date.replace(",", ""), date_fmt)
+                                    txn_date = dt.strftime("%Y-%m-%d")
+                                    break
+                                except ValueError:
+                                    pass
+
                         if not txn_date:
-                            date_match = re.search(r'\b(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})\b', text)
-                            if date_match:
-                                d_str = date_match.group(1)
-                                if '/' in d_str:
-                                    m, d, y = d_str.split('/')
-                                    txn_date = f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
-                                else:
-                                    txn_date = d_str
-                            else:
-                                txn_date = fallback_date
-                        return {"amount": amount, "doc_number": doc_no, "txn_date": txn_date}
+                            date_patterns = [
+                                (r'\b(\d{4}-\d{2}-\d{2})\b', "%Y-%m-%d"),
+                                (r'\b(\d{1,2}/\d{1,2}/\d{4})\b', "%m/%d/%Y"),
+                                (r'\b([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b', "%b %d %Y"),
+                                (r'\b(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})\b', "%d %b %Y"),
+                            ]
+                            for pat, fmt in date_patterns:
+                                m = re.search(pat, text, re.IGNORECASE)
+                                if m:
+                                    d_str = m.group(1).replace(",", "")
+                                    for f in (fmt, fmt.replace("%b", "%B")):
+                                        try:
+                                            dt = datetime.strptime(d_str, f)
+                                            txn_date = dt.strftime("%Y-%m-%d")
+                                            break
+                                        except ValueError:
+                                            pass
+                                    if txn_date:
+                                        break
+
+                        if not txn_date:
+                            last_err = "Missing or unparseable transaction/due date"
+                        else:
+                            return {"amount": amount, "doc_number": doc_no, "txn_date": txn_date}
             else:
                 last_err = f"Ollama HTTP {response.status_code}: {response.text}"
         except Exception as e:
@@ -114,7 +184,6 @@ def upload_to_quickbooks(base_url: str, headers: dict, payload: dict) -> tuple[r
             res = requests.post(url, headers=headers, json=payload, timeout=15)
             if res.status_code == 200:
                 return res, None
-            # Do NOT retry 4xx client errors (bad payload / duplicate doc number / unauthorized)
             if 400 <= res.status_code < 500:
                 return res, f"QuickBooks HTTP {res.status_code} (Non-retryable): {res.text}"
             last_err = f"HTTP {res.status_code}: {res.text}"
@@ -125,6 +194,8 @@ def upload_to_quickbooks(base_url: str, headers: dict, payload: dict) -> tuple[r
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
     return None, f"QuickBooks upload failed after {MAX_RETRIES} attempts. Last error: {last_err}"
 
+
+# QuickBooks Authentication & Setup
 with open("quickbooks.json", "r") as f:
     qb_config = json.load(f)
 
@@ -186,6 +257,7 @@ expense_acc_id = exp_res["QueryResponse"]["Account"][0]["Id"]
 
 print("QuickBooks Setup Complete & Ready.")
 
+# Gmail Setup
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 credentials = Credentials.from_authorized_user_file("token.json", SCOPES) if os.path.exists("token.json") else None
 
@@ -200,10 +272,13 @@ if not credentials or not credentials.valid:
 
 service = build("gmail", "v1", credentials=credentials)
 
-
-query = 'label:TestingLinelink/My Invoices (subject:invoice OR subject:bill OR has:attachment)'
+with open("query.txt", "r") as f:
+    query = f.read()
+    
+print(f"Query: {query}")
 response = service.users().messages().list(userId="me", q=query, maxResults=10).execute()
 messages = response.get("messages", [])
+print(f"Found {len(messages)} messages")
 
 for item in messages:
     message_id = item["id"]
@@ -215,62 +290,81 @@ for item in messages:
 
     print(f"\nProcessing ID: {message_id}\nFrom: {sender}\nSubject: {subject}")
 
+    processed_payloads = []  # list of tuples: (source_label, text_content, attachment_id)
     parts = message.get("payload", {}).get("parts", [])
+
+    # Step 1: Check for supported file attachments (.pdf, .docx)
     for part in parts:
-        filename = part.get("filename")
+        filename = part.get("filename", "")
         attachment_id = part.get("body", {}).get("attachmentId")
 
-        if filename and filename.lower().endswith(".pdf") and attachment_id:
-            attachment = service.users().messages().attachments().get(
-                userId="me", messageId=message_id, id=attachment_id
-            ).execute()
+        if filename and attachment_id:
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in [".pdf", ".docx"]:
+                attachment = service.users().messages().attachments().get(
+                    userId="me", messageId=message_id, id=attachment_id
+                ).execute()
 
-            file_data = base64.urlsafe_b64decode(attachment["data"])
-            with open(filename, "wb") as f:
-                f.write(file_data)
+                file_data = base64.urlsafe_b64decode(attachment["data"])
+                with open(filename, "wb") as f:
+                    f.write(file_data)
 
-            print(f"Downloaded PDF: {filename}")
-            text = ""
-            try:
-                reader = PdfReader(filename)
-                for page in reader.pages:
-                    text += page.extract_text() or ""
-                print(f"--- Extracted PDF Text ---\n{text}\n--------------------------")
-            finally:
-                if os.path.exists(filename):
-                    os.remove(filename)
+                text = ""
+                try:
+                    if ext == ".pdf":
+                        reader = PdfReader(filename)
+                        for page in reader.pages:
+                            text += page.extract_text() or ""
+                    elif ext == ".docx":
+                        text = extract_text_from_docx(filename)
+                finally:
+                    if os.path.exists(filename):
+                        os.remove(filename)
 
-            parsed_data = parse_with_ollama(text)
-            if not parsed_data:
-                err_msg = f"Failed to extract valid invoice fields from {filename} after {MAX_RETRIES} attempts"
-                print(f"SKIP: {filename} - {err_msg}")
-                log_error(filename, message_id, attachment_id, err_msg)
-                continue
+                if text.strip():
+                    processed_payloads.append((filename, text, attachment_id))
 
-            print(f"Extracted -> Date: {parsed_data['txn_date']}, Doc#: {parsed_data['doc_number']}, Amount: ${parsed_data['amount']}")
+    # Step 2: Fall back to Email Body text if no valid attachments were processed
+    if not processed_payloads:
+        body_text = get_email_body(message["payload"])
+        if body_text.strip():
+            processed_payloads.append(("Email Body", body_text, "N/A"))
 
-            payload = {
-                "PaymentType": "Cash",
-                "TxnDate": parsed_data["txn_date"],
-                "DocNumber": parsed_data["doc_number"],
-                "AccountRef": {"value": bank_acc_id},
-                "Line": [{
-                    "Amount": parsed_data["amount"],
-                    "DetailType": "AccountBasedExpenseLineDetail",
-                    "Description": f"Parsed Invoice {parsed_data['doc_number']} via Linelink",
-                    "AccountBasedExpenseLineDetail": {
-                        "AccountRef": {"value": expense_acc_id}
-                    }
-                }]
-            }
+    # Step 3: Run extracted text through Ollama and upload to QuickBooks
+    for source_label, text_content, attachment_id in processed_payloads:
+        print(f"--- Processing Source: {source_label} ---")
+        parsed_data = parse_with_ollama(text_content)
 
-            qb_res, qb_err = upload_to_quickbooks(base_url, headers, payload)
-            if qb_err:
-                print(f"SKIP: {filename} - {qb_err}")
-                log_error(filename, message_id, attachment_id, qb_err)
-                continue
+        if not parsed_data:
+            err_msg = f"Failed to extract valid invoice fields from {source_label} after {MAX_RETRIES} attempts"
+            print(f"SKIP: {source_label} - {err_msg}")
+            log_error(source_label, message_id, attachment_id, err_msg)
+            continue
 
-            try:
-                print(f"SUCCESS: Created QB Purchase ID: {qb_res.json()['Purchase']['Id']}")
-            except (KeyError, ValueError) as e:
-                log_error(filename, message_id, attachment_id, f"QB returned 200 but response was unparseable: {e}")
+        print(f"Extracted -> Date: {parsed_data['txn_date']}, Doc#: {parsed_data['doc_number']}, Amount: ${parsed_data['amount']}")
+
+        payload = {
+            "PaymentType": "Cash",
+            "TxnDate": parsed_data["txn_date"],
+            "DocNumber": parsed_data["doc_number"],
+            "AccountRef": {"value": bank_acc_id},
+            "Line": [{
+                "Amount": parsed_data["amount"],
+                "DetailType": "AccountBasedExpenseLineDetail",
+                "Description": f"Parsed Invoice {parsed_data['doc_number']} via Linelink ({source_label})",
+                "AccountBasedExpenseLineDetail": {
+                    "AccountRef": {"value": expense_acc_id}
+                }
+            }]
+        }
+
+        qb_res, qb_err = upload_to_quickbooks(base_url, headers, payload)
+        if qb_err:
+            print(f"SKIP: {source_label} - {qb_err}")
+            log_error(source_label, message_id, attachment_id, qb_err)
+            continue
+
+        try:
+            print(f"SUCCESS: Created QB Purchase ID: {qb_res.json()['Purchase']['Id']}")
+        except (KeyError, ValueError) as e:
+            log_error(source_label, message_id, attachment_id, f"QB returned 200 but response was unparseable: {e}")
