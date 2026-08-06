@@ -1,4 +1,4 @@
-# Linelink v0.1.0
+# Linelink v0.1.1
 
 A lightweight execution engine that monitors Gmail for invoice PDFs, extracts financial data using a local Ollama model, and automatically creates Purchase entries in QuickBooks Online.
 

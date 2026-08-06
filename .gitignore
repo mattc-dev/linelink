@@ -3,6 +3,7 @@ client_data.json
 token.json
 quickbooks.json
 qb_tokens.json
+errors.log
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
