@@ -8,6 +8,7 @@ my_client_data.json
 query.txt
 processed.json
 failed.json
+browser_downloads/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
